@@ -1,0 +1,12 @@
+name: ecg_csv
+channels:
+  - defaults
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - numpy
+  - matplotlib
+  - pandas
+  - scipy
+  - jupyter
+prefix: /opt/anaconda3/envs/ecg_csv

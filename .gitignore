@@ -1,0 +1,8 @@
+# Ignore conda environments and system junk
+*.pyc
+__pycache__/
+.env/
+.conda/
+env/
+*.ipynb_checkpoints
+.DS_Store
