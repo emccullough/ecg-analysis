@@ -1,8 +1,31 @@
-# Ignore conda environments and system junk
+# Python
 *.pyc
 __pycache__/
+*.egg-info/
+
+# Environments
 .env/
 .conda/
 env/
+venv/
+ecg_library/venv/
+ecg_library/ecg_csv/
+
+# Jupyter
 *.ipynb_checkpoints
+.virtual_documents/
+
+# System
 .DS_Store
+
+# Data (too large for git — sync separately)
+Data/
+Data_Sleep/
+Data_test/
+
+# Model checkpoints (large binary files)
+*.pt
+
+# Temp / archives
+tmp/
+=8
