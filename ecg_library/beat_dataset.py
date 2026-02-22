@@ -182,14 +182,34 @@ class ECGBeatDataset(Dataset):
     beat heatmap and class map targets downsampled to 625 positions.
     """
 
-    def __init__(self, index, augment=False):
+    def __init__(self, index, augment=False, preload=True):
         """
         Args:
             index: pre-built list of segment dicts from _build_index
             augment: apply data augmentation (amplitude scaling, noise, time shift)
+            preload: load + filter all signals into memory at init so each epoch
+                     pays zero disk I/O or scipy cost (recommended on M-series Macs)
         """
         self.index = index
         self.augment = augment
+        self._cache = None
+
+        if preload and len(index) > 0:
+            print(f"  Preloading {len(index)} segments into memory...", end=' ', flush=True)
+            cache = []
+            for entry in index:
+                raw = _load_segment(entry['segment_file'])
+                if len(raw) < SAMPLES_PER_SEGMENT:
+                    raw = np.pad(raw, (0, SAMPLES_PER_SEGMENT - len(raw)))
+                elif len(raw) > SAMPLES_PER_SEGMENT:
+                    raw = raw[:SAMPLES_PER_SEGMENT]
+                filtered = filter_signal(raw, FS)
+                std = np.std(filtered)
+                if std > 1e-6:
+                    filtered = (filtered - np.mean(filtered)) / std
+                cache.append(filtered.astype(np.float32))
+            self._cache = cache
+            print("done.")
 
     def __len__(self):
         return len(self.index)
@@ -197,24 +217,20 @@ class ECGBeatDataset(Dataset):
     def __getitem__(self, idx):
         entry = self.index[idx]
 
-        # Load raw signal
-        raw = _load_segment(entry['segment_file'])
+        if self._cache is not None:
+            signal = self._cache[idx].copy()
+        else:
+            raw = _load_segment(entry['segment_file'])
+            if len(raw) < SAMPLES_PER_SEGMENT:
+                raw = np.pad(raw, (0, SAMPLES_PER_SEGMENT - len(raw)))
+            elif len(raw) > SAMPLES_PER_SEGMENT:
+                raw = raw[:SAMPLES_PER_SEGMENT]
+            filtered = filter_signal(raw, FS)
+            std = np.std(filtered)
+            if std > 1e-6:
+                filtered = (filtered - np.mean(filtered)) / std
+            signal = filtered.astype(np.float32)
 
-        # Pad or truncate to exactly 2500 samples
-        if len(raw) < SAMPLES_PER_SEGMENT:
-            raw = np.pad(raw, (0, SAMPLES_PER_SEGMENT - len(raw)))
-        elif len(raw) > SAMPLES_PER_SEGMENT:
-            raw = raw[:SAMPLES_PER_SEGMENT]
-
-        # Filter (bandpass + baseline removal)
-        filtered = filter_signal(raw, FS)
-
-        # Normalize to zero-mean, unit-std
-        std = np.std(filtered)
-        if std > 1e-6:
-            filtered = (filtered - np.mean(filtered)) / std
-
-        signal = filtered.astype(np.float32)
         beats = list(entry['beats'])
 
         # Augmentation

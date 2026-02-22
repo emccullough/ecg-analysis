@@ -1,26 +1,18 @@
 # Filters
-# # Import necessary libraries
 
-from scipy.signal import butter, filtfilt, medfilt
+from scipy.signal import butter, sosfiltfilt, medfilt
 
-# Define the bandpass filter function (assuming it's not provided in the pasted code)
-def butter_bandpass(lowcut, highcut, fs, order=5):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
+# Precompute filter coefficients once at import time (125 Hz device, fixed cutoffs).
+# Using SOS (second-order sections) + sosfiltfilt is more numerically stable
+# than the ba-form filtfilt and avoids recomputing coefficients on every call.
+_FS = 125
+_SOS = butter(5, [0.5 / (_FS / 2), 40.0 / (_FS / 2)], btype='band', output='sos')
+_BASELINE_KERNEL = 63  # int(_FS * 0.5) = 62, rounded up to nearest odd
 
-# Function to filter the ECG signal
-def filter_signal(combined_ecg_data, fs):
-    lowcut = 0.5
-    highcut = 40.0
-    b, a = butter_bandpass(lowcut, highcut, fs)
-    filtered_ecg = filtfilt(b, a, combined_ecg_data)
-    kernel_size = int(fs * 0.5)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    baseline = medfilt(filtered_ecg, kernel_size=kernel_size)
-    filtered_ecg -= baseline
-    return filtered_ecg
+
+def filter_signal(signal, fs):
+    filtered = sosfiltfilt(_SOS, signal)
+    baseline = medfilt(filtered, kernel_size=_BASELINE_KERNEL)
+    filtered -= baseline
+    return filtered
 

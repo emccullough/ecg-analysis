@@ -1,4 +1,4 @@
-from .filters import butter_bandpass
+from .filters import filter_signal
 from .PQRST import detect_qrs, detect_pqt
 from .utils import parse_folder, load_ecg_data, save_rich_data
 from .anomalies import analyze_anomalies
