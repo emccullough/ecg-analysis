@@ -75,13 +75,26 @@ def analyze_rr_anomalies(
         baseline = np.full(len(rr), np.nan)
         flags = np.full(len(rr), '', dtype=object)
 
-        # Rolling median over the window of preceding beats
+        # Rolling median over the window of preceding beats.
+        # Robust baseline: exclude long-pause RRs (> 1.5× the minimum in the
+        # window) so that a compensatory or missed-beat gap doesn't inflate the
+        # expected-interval estimate — the classic bootstrap problem at segment
+        # start (e.g. [0.800, 1.640] → median 1.220 → next normal beat looks
+        # premature).  When not enough "clean" values are available, fall back
+        # to the minimum as a conservative lower bound.
         for i in range(len(rr)):
             start = max(0, i - window)
             vals = rr[start:i]
             vals = vals[np.isfinite(vals)]
             if len(vals) >= 2:
-                baseline[i] = np.median(vals)
+                min_val = np.min(vals)
+                normal_vals = vals[vals <= min_val * 1.5]
+                if len(normal_vals) >= 2:
+                    baseline[i] = np.median(normal_vals)
+                else:
+                    # Only paused beats in window so far; use minimum as
+                    # conservative baseline to avoid false 'premature' flags.
+                    baseline[i] = min_val
 
         # Classify each beat using the baseline
         prev_was_premature = False
