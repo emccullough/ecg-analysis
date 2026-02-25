@@ -57,6 +57,15 @@ def save_annotation(session, r_index, algo_label, human_label, metadata, path="a
     return df
 
 
+def delete_annotation(session, r_index, path="annotations.csv"):
+    """Remove the annotation row for (session, r_index) if it exists."""
+    df = load_annotations(path)
+    mask = (df["session"] == session) & (df["r_index"] == int(r_index))
+    if mask.any():
+        df = df[~mask]
+        df.to_csv(path, index=False)
+
+
 def get_annotation_status(session, annotations_df):
     """Return dict with annotation progress for a session."""
     session_df = annotations_df[annotations_df["session"] == session]

@@ -24,6 +24,7 @@ BEAT_TYPE_MAP = {
     'AV': 0,
     'Artifact': 0,
     'Other': 0,
+    'Deleted': -1,   # beat marked as false-positive — excluded from training
 }
 
 CLASS_NAMES = {0: 'Other', 1: 'Normal', 2: 'PVC'}
@@ -116,7 +117,13 @@ def _build_index(data_dir, annotations_path=None):
             if seg_idx >= n_segments:
                 continue
             ecg_path = ecg_files[seg_idx]
-            sorted_beats = sorted(beats, key=lambda x: x[0])
+            # Exclude beats explicitly marked as deleted (false-positives)
+            sorted_beats = sorted(
+                [(r, c) for r, c in beats if c != -1],
+                key=lambda x: x[0],
+            )
+            if not sorted_beats:
+                continue
             class_ids = {c for _, c in sorted_beats}
             raw_types = segment_types.get(seg_idx, set())
             index.append({
