@@ -4,10 +4,21 @@ RR-interval anomaly analysis — v2 signal processing layer.
 Reads the beat DataFrame produced by v1 (rich_processed_beats.csv) and adds
 three columns that capture timing-based anomalies independent of morphology:
 
-    rr_baseline    rolling median RR of the preceding `window` beats (seconds)
+    rr_baseline    rolling median RR of the preceding `window` normal beats
     rr_flag        'premature' | 'compensatory' | 'missed_beat' | ''
     rr_burden_pct  % of premature beats in this segment (same value for all
                    beats in the same segment, used as a per-segment stat)
+
+Baseline strategy
+-----------------
+Only beats classified as 'normal' by v1 contribute to the rolling median
+baseline, and only when their RR interval does not exceed MAX_PAUSE_RR (1.5 s).
+This keeps PVC/VT intervals and their following compensatory pauses from
+inflating the expected-interval estimate — without any heuristic thresholds.
+
+A normal beat whose RR is anomalously long (it follows a compensatory pause
+that crossed a segment boundary, for example) is simply excluded from the
+baseline window; its rr_baseline will be NaN and it won't be flagged.
 
 Classification logic
 --------------------
@@ -28,6 +39,10 @@ get 0.0 and can be filtered out quickly.
 import numpy as np
 import pandas as pd
 
+# RR values above this are definite pauses — never a normal beat interval.
+# 1.5 s ≈ 40 bpm; no healthy resting heart rate is slower than this.
+MAX_PAUSE_RR = 1.5  # seconds
+
 
 def analyze_rr_anomalies(
     beats_df,
@@ -41,11 +56,12 @@ def analyze_rr_anomalies(
     Parameters
     ----------
     beats_df : pd.DataFrame
-        Output of v1 processing — must contain columns ``rr_interval`` and
-        ``filename`` (one row per beat, sorted in time order within each file).
+        Output of v1 processing — must contain columns ``rr_interval``,
+        ``beat_type``, and ``filename`` (one row per beat, sorted in time
+        order within each file).
     window : int
-        Number of preceding beats used for the rolling median baseline.
-        Minimum 2 beats required before any flag is assigned.
+        Number of preceding *normal* beats used for the rolling median
+        baseline.  Minimum 2 normal beats required before any flag is assigned.
     short_thresh : float
         Fraction of baseline below which an RR is 'premature' (default 0.80).
     long_thresh : float
@@ -71,32 +87,33 @@ def analyze_rr_anomalies(
     for fname, seg in df.groupby('filename', sort=False):
         idxs = seg.index.tolist()
         rr = seg['rr_interval'].values.astype(float)
+        beat_types = seg['beat_type'].values
 
         baseline = np.full(len(rr), np.nan)
         flags = np.full(len(rr), '', dtype=object)
 
-        # Rolling median over the window of preceding beats.
-        # Robust baseline: exclude long-pause RRs (> 1.5× the minimum in the
-        # window) so that a compensatory or missed-beat gap doesn't inflate the
-        # expected-interval estimate — the classic bootstrap problem at segment
-        # start (e.g. [0.800, 1.640] → median 1.220 → next normal beat looks
-        # premature).  When not enough "clean" values are available, fall back
-        # to the minimum as a conservative lower bound.
+        # Build rolling baseline from *normal* beats only, capped at MAX_PAUSE_RR.
+        # Using v1's beat_type classification means PVC/VT intervals and the
+        # compensatory pause that follows them are automatically excluded —
+        # no heuristic needed. The remaining RR cap handles the rare case where
+        # a normal-classified beat has a cross-segment compensatory-pause-length
+        # interval at the start of a file.
+        normal_rr = np.where(
+            (beat_types == 'normal') & np.isfinite(rr) & (rr <= MAX_PAUSE_RR),
+            rr,
+            np.nan,
+        )
+
         for i in range(len(rr)):
             start = max(0, i - window)
-            vals = rr[start:i]
+            vals = normal_rr[start:i]
             vals = vals[np.isfinite(vals)]
             if len(vals) >= 2:
-                min_val = np.min(vals)
-                normal_vals = vals[vals <= min_val * 1.5]
-                if len(normal_vals) >= 2:
-                    baseline[i] = np.median(normal_vals)
-                else:
-                    # Only paused beats in window so far; use minimum as
-                    # conservative baseline to avoid false 'premature' flags.
-                    baseline[i] = min_val
+                baseline[i] = np.median(vals)
 
-        # Classify each beat using the baseline
+        # Classify each beat (normal *and* PVC/VT) against the baseline.
+        # This lets v2 catch premature beats that v1's morphology detector missed
+        # (e.g. interpolated PVCs with a near-normal QRS shape).
         prev_was_premature = False
         for i in range(len(rr)):
             if not np.isfinite(rr[i]) or not np.isfinite(baseline[i]):
