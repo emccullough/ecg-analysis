@@ -95,6 +95,12 @@ def _s_dominant_post_check(
     s_local_offset = int(np.argmin(pre_sig))
     s_abs = s_start + s_local_offset
 
+    # Guard: if the S-trough is within 12 samples of s_start it is almost
+    # certainly residual S-wave / ST segment of the *previous detected* beat
+    # bleeding into the scan zone — not a new S-dominant QRS.  Skip.
+    if s_abs - s_start < 12:
+        return best_center, best_corr, best_label
+
     # Search for a positive R within max_rs_gap samples before the S-trough
     r_start = max(0, s_abs - max_rs_gap)
     if r_start >= s_abs:
@@ -130,6 +136,11 @@ def _s_dominant_post_check(
 # RR values above this are definite pauses — never a normal beat interval.
 # 1.5 s ≈ 40 bpm; no healthy resting heart rate is slower than this.
 MAX_PAUSE_RR = 1.5  # seconds
+
+# Minimum samples from the previous detected R-peak before the missed-beat
+# scan zone may start.  Clears the T-wave of the previous beat even at low
+# heart rates (QT ≤ 400 ms at ≤ 75 bpm → 50 samples at 125 Hz).
+MIN_T_SKIP = 50
 
 
 def analyze_rr_anomalies(
@@ -330,13 +341,14 @@ def find_missed_beat_candidates(beats_df, session_dir, library=None,
             if not np.isfinite(baseline_s) or curr_r <= prev_r:
                 continue
 
-            # Search the central 60 % of the gap (skip 20 % on each side to
-            # avoid the T-wave tail of the prev beat and the early deflection
-            # of the detected beat at curr_r).
-            gap_samp = curr_r - prev_r
-            margin   = max(int(gap_samp * 0.20), 5)
-            s_start  = max(prev_r + margin, 0)
-            s_end    = min(curr_r - margin, len(sig))
+            # Search zone: skip at least MIN_T_SKIP samples from prev_r to
+            # clear its T-wave, but cap the left margin so the zone doesn't
+            # collapse for small gaps (keeps ≥ 10 samples available).
+            gap_samp    = curr_r - prev_r
+            margin      = max(int(gap_samp * 0.20), 5)
+            left_margin = max(margin, min(MIN_T_SKIP, gap_samp - margin - 10))
+            s_start     = prev_r + left_margin
+            s_end       = min(curr_r - margin, len(sig))
 
             if s_end <= s_start:
                 continue
@@ -556,9 +568,10 @@ def find_cross_segment_missed_beats(beats_df, session_dir, library=None,
         if gap_len < 10:
             continue
 
-        # Search the central 60 % of the gap.
+        # Search zone: same T-wave clearance logic as intra-segment scanner.
         margin  = max(int(gap_len * 0.20), 5)
-        s_start = margin
+        left_margin = max(margin, min(MIN_T_SKIP, gap_len - margin - 10))
+        s_start = left_margin
         s_end   = gap_len - margin
         if s_end <= s_start:
             continue
