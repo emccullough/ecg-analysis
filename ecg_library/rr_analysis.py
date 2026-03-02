@@ -42,6 +42,91 @@ import re
 import numpy as np
 import pandas as pd
 
+# Imported lazily inside functions to avoid circular imports.
+# Needed for template-based classification of missed-beat candidates.
+_SCORE_BEAT    = None
+_DEFAULT_WIN   = (20, 30)  # (before, after) — must match pvc_templates defaults
+
+
+def _get_score_beat():
+    global _SCORE_BEAT, _DEFAULT_WIN
+    if _SCORE_BEAT is None:
+        from ecg_library.pvc_templates import score_beat, DEFAULT_BEFORE, DEFAULT_AFTER
+        _SCORE_BEAT  = score_beat
+        _DEFAULT_WIN = (DEFAULT_BEFORE, DEFAULT_AFTER)
+    return _SCORE_BEAT, _DEFAULT_WIN
+
+def _s_dominant_post_check(
+    sig, s_start, best_center, best_corr, best_label,
+    score_fn, labels_list, library, morph_threshold, bef, aft,
+    normal_amp, min_r_amp=30, max_rs_gap=8,
+):
+    """After the sliding template scan, check whether *best_center* is a T-wave.
+
+    S-dominant beats (small positive R followed immediately by a large negative
+    S-wave) have their T-waves at roughly +200–300 ms after the R.  Because the
+    T-wave amplitude is often large compared to the tiny R, the sliding scan
+    picks the T-wave as the best PVC match instead of the actual QRS.
+
+    Detection: if a large negative S-trough is found in the zone
+    ``[s_start, best_center - 3]``, this S-trough is the end of a QRS whose
+    tiny R-peak lies 1–``max_rs_gap`` samples before it.  The candidate is
+    relocated to that R-peak and re-scored; the type is set to ``'normal'``
+    if the score is below *morph_threshold*.
+
+    Returns (new_center, new_corr, new_label) — unchanged if the check
+    does not find a prior S-trough.
+    """
+    pre_end = best_center - 3
+    if pre_end <= s_start:
+        return best_center, best_corr, best_label
+
+    pre_sig = sig[s_start:pre_end]
+    pre_min = float(np.min(pre_sig))
+
+    # Threshold: "large negative" relative to normal amplitude
+    neg_thresh = (max(-100.0, -abs(normal_amp) * 0.4)
+                  if np.isfinite(normal_amp) else -100.0)
+
+    if pre_min >= neg_thresh:
+        return best_center, best_corr, best_label  # no large S-trough
+
+    # Locate the S-trough
+    s_local_offset = int(np.argmin(pre_sig))
+    s_abs = s_start + s_local_offset
+
+    # Search for a positive R within max_rs_gap samples before the S-trough
+    r_start = max(0, s_abs - max_rs_gap)
+    if r_start >= s_abs:
+        return best_center, best_corr, best_label
+    r_zone     = sig[r_start:s_abs]
+    r_peak_pos = int(np.argmax(r_zone))
+    r_peak_amp = float(r_zone[r_peak_pos])
+
+    if r_peak_amp < min_r_amp:
+        return best_center, best_corr, best_label  # no valid R found
+
+    actual_r = r_start + r_peak_pos
+
+    # Re-score at the actual R position
+    lo2 = actual_r - bef
+    hi2 = actual_r + aft + 1
+    if lo2 < 0 or hi2 > len(sig):
+        return best_center, best_corr, best_label
+
+    win2       = sig[lo2:hi2].astype(float)
+    best2      = -np.inf
+    lbl2       = 'normal'
+    for lbl in labels_list:
+        c2 = score_fn(win2, library, label=lbl)
+        if np.isfinite(c2) and c2 > best2:
+            best2 = c2
+            lbl2  = lbl
+
+    new_label = lbl2 if best2 >= morph_threshold else 'normal'
+    return actual_r, float(best2), new_label
+
+
 # RR values above this are definite pauses — never a normal beat interval.
 # 1.5 s ≈ 40 bpm; no healthy resting heart rate is slower than this.
 MAX_PAUSE_RR = 1.5  # seconds
@@ -150,28 +235,25 @@ def analyze_rr_anomalies(
     return df
 
 
-def find_missed_beat_candidates(beats_df, session_dir, fs=125):
+def find_missed_beat_candidates(beats_df, session_dir, library=None,
+                                morph_threshold=0.80, fs=125):
     """Search ECG gaps flagged as 'missed_beat' for a hidden QRS complex.
 
     For each beat whose ``rr_flag == 'missed_beat'``, the function loads the
     raw ECG for that segment, isolates the central zone of the gap (between
     the previous detected beat and the flagged beat), and looks for the
-    largest-amplitude peak.  The peak is then classified as:
+    largest-amplitude peak.
 
-    ``'normal'``
-        Positive peak with amplitude 0.35 – 1.5 × the segment's median
-        normal-beat R-amplitude.  Likely a genuine QRS the v1 detector missed.
+    When *library* is supplied the candidate peak is classified by Pearson
+    correlation against the mean templates (``score_beat``).  The best-matching
+    label is used when its correlation exceeds *morph_threshold*; otherwise the
+    candidate is marked ``'weak'``.
 
-    ``'PVC'``
-        Either a negative-dominant peak (inverted QRS, classic VT/PVC
-        morphology) OR a positive peak > 1.5 × normal amplitude (broad
-        high-voltage QRS also common in PVCs).
+    When *library* is ``None`` a polarity/amplitude heuristic is used as
+    fallback (negative-dominant → ``'PVC'``; positive 0.35–1.5× normal →
+    ``'normal'``; etc.)
 
-    ``'weak'``
-        Peak found but amplitude < 0.35 × normal.  Likely a T-wave or noise,
-        not a missed QRS.
-
-    The search window is the central 40 % of the gap (20 % margin on each
+    The search window is the central 60 % of the gap (20 % margin on each
     side), which avoids the T-wave and early repolarisation of the flanking
     detected beats.
 
@@ -181,6 +263,11 @@ def find_missed_beat_candidates(beats_df, session_dir, fs=125):
         v2 beat DataFrame (output of ``analyze_rr_anomalies``).
     session_dir : str
         Path to the folder containing the ecg_N.csv segment files.
+    library : dict or None
+        Template library from ``load_template_library``.  If provided,
+        correlation-based classification is used.
+    morph_threshold : float
+        Minimum Pearson correlation to assign a template label (default 0.80).
     fs : int
         Sampling frequency in Hz (default 125).
 
@@ -198,7 +285,8 @@ def find_missed_beat_candidates(beats_df, session_dir, fs=125):
         ``candidate_amp``   filtered-signal amplitude at candidate_r
         ``normal_amp_med``  median R-amplitude of normal beats in the segment
         ``amp_ratio``       abs(candidate_amp) / normal_amp_med
-        ``candidate_type``  'normal' | 'PVC' | 'weak'
+        ``candidate_type``  template label (e.g. 'PVC', 'VT') or 'weak'
+        ``morph_corr``      Pearson correlation used for classification (NaN if heuristic)
     """
     from ecg_library.filters import filter_signal
 
@@ -253,54 +341,98 @@ def find_missed_beat_candidates(beats_df, session_dir, fs=125):
             if s_end <= s_start:
                 continue
 
-            window  = sig[s_start:s_end]
-            max_pos = float(np.max(window))
-            max_neg = float(np.min(window))
+            # ── Slide the template window across the gap ──────────────────────
+            # Centering on the dominant amplitude peak fails when the S-wave
+            # is larger than the R-wave (common during high-intensity exercise):
+            # the S-trough gets picked, its window matches the VT template, and
+            # a normal beat is mis-classified.  Sliding across all positions and
+            # picking the best shape match avoids this entirely.
+            ctype      = 'weak'
+            morph_corr = np.nan
+            candidate_r   = (s_start + s_end) // 2   # fallback if no library
+            candidate_amp = float(sig[candidate_r])
 
-            # Dominant peak: largest absolute amplitude in the window.
-            if abs(max_neg) > abs(max_pos):
-                candidate_amp = max_neg
-                candidate_r   = int(np.argmin(window)) + s_start
-                polarity      = 'negative'
-            else:
-                candidate_amp = max_pos
-                candidate_r   = int(np.argmax(window)) + s_start
-                polarity      = 'positive'
+            if library is not None:
+                score_fn, (bef, aft) = _get_score_beat()
+                labels_list = list(library.get('mean_templates', {}).keys())
+                best_center = None
+                best_label  = None
+                best_corr   = -np.inf
 
-            # Classify.
-            if not np.isfinite(normal_amp) or normal_amp <= 0:
-                ctype = 'unknown'
+                for center in range(s_start, s_end):
+                    lo = center - bef
+                    hi = center + aft + 1
+                    if lo < 0 or hi > len(sig):
+                        continue
+                    win = sig[lo:hi].astype(float)
+                    for lbl in labels_list:
+                        c = score_fn(win, library, label=lbl)
+                        if np.isfinite(c) and c > best_corr:
+                            best_corr  = c
+                            best_label = lbl
+                            best_center = center
+
+                # S-dominant post-check: re-locate if best candidate is a T-wave
+                if best_center is not None and best_corr >= morph_threshold:
+                    best_center, best_corr, best_label = _s_dominant_post_check(
+                        sig, s_start, best_center, best_corr, best_label,
+                        score_fn, labels_list, library, morph_threshold,
+                        bef, aft, normal_amp,
+                    )
+
+                if best_center is not None:
+                    candidate_r   = best_center
+                    candidate_amp = float(sig[best_center])
+                    if best_label == 'normal' or best_corr >= morph_threshold:
+                        ctype      = best_label
+                        morph_corr = round(float(best_corr), 3)
             else:
-                ratio = abs(candidate_amp) / abs(normal_amp)
-                if ratio < 0.35:
-                    ctype = 'weak'
-                elif polarity == 'negative':
-                    # Negative-dominant peak = inverted QRS → PVC/VT
-                    ctype = 'PVC'
-                elif ratio > 1.5:
-                    # Large positive QRS also typical of PVC morphology
-                    ctype = 'PVC'
+                # Heuristic fallback (no library): dominant peak + polarity.
+                window_arr = sig[s_start:s_end]
+                max_pos    = float(np.max(window_arr))
+                max_neg    = float(np.min(window_arr))
+                if abs(max_neg) > abs(max_pos):
+                    candidate_amp = max_neg
+                    candidate_r   = int(np.argmin(window_arr)) + s_start
+                    polarity      = 'negative'
                 else:
-                    ctype = 'normal'
+                    candidate_amp = max_pos
+                    candidate_r   = int(np.argmax(window_arr)) + s_start
+                    polarity      = 'positive'
+
+                if not np.isfinite(normal_amp) or normal_amp <= 0:
+                    ctype = 'unknown'
+                else:
+                    ratio = abs(candidate_amp) / abs(normal_amp)
+                    if ratio < 0.35:
+                        ctype = 'weak'
+                    elif polarity == 'negative':
+                        ctype = 'PVC'
+                    elif ratio > 1.5:
+                        ctype = 'PVC'
+                    else:
+                        ctype = 'normal'
 
             results.append({
-                'filename':      fname,
-                'missed_at_r':   curr_r,
-                'prev_r':        prev_r,
-                'gap_s':         round(gap_samp / fs, 3),
-                'baseline_s':    round(baseline_s, 3),
-                'candidate_r':   candidate_r,
-                'candidate_amp': round(candidate_amp, 1),
+                'filename':       fname,
+                'missed_at_r':    curr_r,
+                'prev_r':         prev_r,
+                'gap_s':          round(gap_samp / fs, 3),
+                'baseline_s':     round(baseline_s, 3),
+                'candidate_r':    candidate_r,
+                'candidate_amp':  round(candidate_amp, 1),
                 'normal_amp_med': round(normal_amp, 1) if np.isfinite(normal_amp) else np.nan,
-                'amp_ratio':     round(abs(candidate_amp) / abs(normal_amp), 2)
-                                 if np.isfinite(normal_amp) and normal_amp > 0 else np.nan,
+                'amp_ratio':      round(abs(candidate_amp) / abs(normal_amp), 2)
+                                  if np.isfinite(normal_amp) and normal_amp > 0 else np.nan,
                 'candidate_type': ctype,
+                'morph_corr':     morph_corr,
             })
 
     return pd.DataFrame(results) if results else pd.DataFrame()
 
 
-def find_cross_segment_missed_beats(beats_df, session_dir, fs=125, missed_thresh=1.70):
+def find_cross_segment_missed_beats(beats_df, session_dir, library=None,
+                                    morph_threshold=0.80, fs=125, missed_thresh=1.70):
     """Search for hidden QRS complexes in anomalously long cross-segment gaps.
 
     The first beat of every segment has no RR interval (NaN), so
@@ -371,18 +503,6 @@ def find_cross_segment_missed_beats(beats_df, session_dir, fs=125, missed_thresh
                 _sig_cache[fname] = filter_signal(raw, fs)
         return _sig_cache[fname]
 
-    def _classify(candidate_amp, polarity, normal_amp):
-        if not np.isfinite(normal_amp) or normal_amp <= 0:
-            return 'unknown'
-        ratio = abs(candidate_amp) / abs(normal_amp)
-        if ratio < 0.35:
-            return 'weak'
-        if polarity == 'negative':
-            return 'PVC'
-        if ratio > 1.5:
-            return 'PVC'
-        return 'normal'
-
     results = []
 
     for i in range(len(all_files) - 1):
@@ -443,29 +563,83 @@ def find_cross_segment_missed_beats(beats_df, session_dir, fs=125, missed_thresh
         if s_end <= s_start:
             continue
 
-        window  = gap_signal[s_start:s_end]
-        max_pos = float(np.max(window))
-        max_neg = float(np.min(window))
+        # ── Slide the template window across the gap ──────────────────────────
+        ctype      = 'weak'
+        morph_corr = np.nan
+        candidate_local = (s_start + s_end) // 2   # fallback
+        candidate_amp   = float(gap_signal[candidate_local])
 
-        if abs(max_neg) > abs(max_pos):
-            candidate_amp   = max_neg
-            candidate_local = int(np.argmin(window)) + s_start
-            polarity        = 'negative'
+        if library is not None:
+            score_fn, (bef, aft) = _get_score_beat()
+            labels_list = list(library.get('mean_templates', {}).keys())
+            best_center = None
+            best_label  = None
+            best_corr   = -np.inf
+
+            for center in range(s_start, s_end):
+                lo = center - bef
+                hi = center + aft + 1
+                if lo < 0 or hi > len(gap_signal):
+                    continue
+                win = gap_signal[lo:hi].astype(float)
+                for lbl in labels_list:
+                    c = score_fn(win, library, label=lbl)
+                    if np.isfinite(c) and c > best_corr:
+                        best_corr  = c
+                        best_label = lbl
+                        best_center = center
+
+            # S-dominant post-check: re-locate if best candidate is a T-wave
+            if best_center is not None and best_corr >= morph_threshold:
+                best_center, best_corr, best_label = _s_dominant_post_check(
+                    gap_signal, s_start, best_center, best_corr, best_label,
+                    score_fn, labels_list, library, morph_threshold,
+                    bef, aft, normal_amp,
+                )
+
+            if best_center is not None:
+                candidate_local = best_center
+                candidate_amp   = float(gap_signal[best_center])
+                if best_label == 'normal' or best_corr >= morph_threshold:
+                    ctype      = best_label
+                    morph_corr = round(float(best_corr), 3)
         else:
-            candidate_amp   = max_pos
-            candidate_local = int(np.argmax(window)) + s_start
-            polarity        = 'positive'
+            # Heuristic fallback (no library): dominant peak + polarity.
+            window      = gap_signal[s_start:s_end]
+            max_pos     = float(np.max(window))
+            max_neg     = float(np.min(window))
+            if abs(max_neg) > abs(max_pos):
+                candidate_amp   = max_neg
+                candidate_local = int(np.argmin(window)) + s_start
+                polarity        = 'negative'
+            else:
+                candidate_amp   = max_pos
+                candidate_local = int(np.argmax(window)) + s_start
+                polarity        = 'positive'
 
-        # Map candidate_local back to (file, r_index).
+            if not np.isfinite(normal_amp) or normal_amp <= 0:
+                ctype = 'unknown'
+            else:
+                ratio = abs(candidate_amp) / abs(normal_amp)
+                if ratio < 0.35:
+                    ctype = 'weak'
+                elif polarity == 'negative':
+                    ctype = 'PVC'
+                elif ratio > 1.5:
+                    ctype = 'PVC'
+                else:
+                    ctype = 'normal'
+
+        # Map candidate_local back to (file, r_index, signal array).
         tail_len = len(tail)
         if candidate_local < tail_len:
             cand_file = fn_n
             cand_r    = last_r + candidate_local
+            cand_sig  = sig_n
         else:
             cand_file = fn_n1
             cand_r    = candidate_local - tail_len   # local index in N+1
-
-        ctype = _classify(candidate_amp, polarity, normal_amp)
+            cand_sig  = sig_n1
 
         results.append({
             'filename':       fn_n1,       # N+1 — for viewer look-up
@@ -482,6 +656,7 @@ def find_cross_segment_missed_beats(beats_df, session_dir, fs=125, missed_thresh
             'amp_ratio':      round(abs(candidate_amp) / abs(normal_amp), 2)
                               if np.isfinite(normal_amp) and normal_amp > 0 else np.nan,
             'candidate_type': ctype,
+            'morph_corr':     morph_corr,
         })
 
     return pd.DataFrame(results) if results else pd.DataFrame()
